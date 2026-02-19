@@ -1,189 +1,172 @@
-"""
-Benchmark: Naive runtime Terrain-RGB gradient computation
-vs. precomputed encoded tile lookup.
+# Terrain Gradient Encoding — Benchmark
 
-Naive approach:
-  For each agent at each step:
-    1. Read R,G,B of pixel (x,y)        -> compute E = R*65536 + G*256 + B
-    2. Apply elevation formula           -> z = -10000 + 0.1*E
-    3. Do same for 4 neighbors
-    4. Apply central difference          -> g_NS, g_EW
-    5. Dot product with heading          -> g_parallel
+Companion code for the paper:
 
-Encoded approach:
-  Preprocessing (offline, not timed):
-    Decode all elevations, compute all gradients, encode to 8-bit tile.
-  Per agent per step:
-    1. Read R,G of gradient tile at (x,y)
-    2. Decode g_NS = (R-128)/127 * g_max
-    3. Decode g_EW = (G-128)/127 * g_max
-    4. Dot product with heading          -> g_parallel
-"""
+> **Two-Component Terrain Gradient Encoding for Constant-Time Slope Lookup in Grid-Based Simulation**
+> Ehsan Sobhani, Geoffrey Pond
+> Interservice/Industry Training, Simulation and Education Conference (I/ITSEC), 2025
 
-import numpy as np
-import time
+## Overview
 
-RNG = np.random.default_rng(42)
-TILE_W, TILE_H = 2048, 2048   # large synthetic tile
-G_MAX = 0.5
-STEPS = 10_000
+This repository contains the benchmark script used to empirically evaluate the
+runtime performance of the proposed terrain gradient encoding scheme against a
+naïve baseline in a synthetic grid-based agent simulation.
 
-# ----------------------------------------------------------------
-# Build synthetic Terrain-RGB tile (W x H x 3, uint8)
-# ----------------------------------------------------------------
-def make_terrain_rgb(W, H):
-    # Synthetic elevation: smooth hills via sine waves
-    x = np.linspace(0, 4*np.pi, W)
-    y = np.linspace(0, 4*np.pi, H)
-    XX, YY = np.meshgrid(x, y)
-    elev_m = 200 + 150*np.sin(XX)*np.cos(YY*0.7) + 80*np.cos(XX*1.3 + YY)
-    # Convert to Terrain-RGB encoding
-    E = np.round((elev_m + 10000) / 0.1).astype(np.int32)
-    E = np.clip(E, 0, 2**24 - 1)
-    R = ((E >> 16) & 0xFF).astype(np.uint8)
-    G = ((E >> 8)  & 0xFF).astype(np.uint8)
-    B = ( E        & 0xFF).astype(np.uint8)
-    tile = np.stack([R, G, B], axis=2)   # shape (H, W, 3)
-    return tile
+The proposed method precomputes signed north–south and east–west slope components
+from Terrain-RGB elevation tiles and encodes them into the red and green channels
+of an output raster tile. During simulation, the heading-aligned terrain grade is
+retrieved in O(1) time per agent per step via a single pixel read and a dot product,
+eliminating all elevation decoding and finite-difference computation from the
+runtime inner loop.
 
-# ----------------------------------------------------------------
-# PREPROCESSING: Build encoded gradient tile (offline)
-# ----------------------------------------------------------------
-def build_gradient_tile(terrain_rgb, lat_deg=43.81, zoom=14, g_max=G_MAX):
-    H, W, _ = terrain_rgb.shape
-    R = terrain_rgb[:,:,0].astype(np.float32)
-    G = terrain_rgb[:,:,1].astype(np.float32)
-    B = terrain_rgb[:,:,2].astype(np.float32)
-    E = R * 65536 + G * 256 + B
-    z = -10000.0 + 0.1 * E                # elevation in metres, shape (H,W)
+## Repository Structure
 
-    # Ground resolution (Web Mercator)
-    d = 156543.034 * np.cos(np.radians(lat_deg)) / (2 ** zoom)
+```
+terrain-gradient-encoding/
+├── benchmark.py       # Full benchmark: tile generation, encoding, and runtime comparison
+└── README.md
+```
 
-    # Central differences (interior pixels; border clamped)
-    g_EW = np.zeros_like(z)
-    g_NS = np.zeros_like(z)
-    g_EW[:, 1:-1] = (z[:, 2:] - z[:, :-2]) / (2 * d)
-    g_NS[1:-1, :] = (z[:-2, :] - z[2:, :]) / (2 * d)
-    # clamp borders
-    g_EW[:, 0]  = g_EW[:, 1]
-    g_EW[:, -1] = g_EW[:, -2]
-    g_NS[0, :]  = g_NS[1, :]
-    g_NS[-1, :] = g_NS[-2, :]
+## What `benchmark.py` Does
 
-    # Encode to uint8
-    def enc(g):
-        g_clip = np.clip(g / g_max, -1.0, 1.0)
-        b = np.round(128 + 127 * g_clip).astype(np.uint8)
-        return b
+The script implements and times two approaches end-to-end:
 
-    grad_tile = np.stack([enc(g_NS), enc(g_EW),
-                          np.zeros((H, W), dtype=np.uint8)], axis=2)
-    return grad_tile, d
+**Naïve approach** — performed per agent per step at runtime:
+1. Read R, G, B channels of the center pixel and its 4 neighbors
+2. Reconstruct 24-bit integer: `E = R×65536 + G×256 + B`
+3. Decode elevation: `z = −10000 + 0.1 × E` (×5 pixels)
+4. Apply central differences to estimate `g_NS` and `g_EW`
+5. Dot product with agent heading → directional grade
 
-# ----------------------------------------------------------------
-# Generate random agent positions and headings
-# ----------------------------------------------------------------
-def make_agents(n, W, H):
-    # pixel positions (interior so central diff always valid)
-    px = RNG.integers(1, W-1, size=n)
-    py = RNG.integers(1, H-1, size=n)
-    # random unit headings (hx=east component, hy=north component)
-    theta = RNG.uniform(0, 2*np.pi, size=n)
-    hx = np.cos(theta).astype(np.float32)
-    hy = np.sin(theta).astype(np.float32)
-    return px, py, hx, hy
+**Encoded approach** — preprocessing done once offline, then per agent per step:
+1. Read R, G channels from the precomputed gradient tile
+2. Decode: `g_NS = ((R − 128) / 127) × g_max`
+3. Decode: `g_EW = ((G − 128) / 127) × g_max`
+4. Dot product with agent heading → directional grade
 
-# ----------------------------------------------------------------
-# NAIVE: decode elevation + central diff at runtime, vectorised
-#        over all agents simultaneously (one step at a time)
-# ----------------------------------------------------------------
-def naive_step(terrain_rgb, px, py, hx, hy):
-    """Compute heading-aligned grade for all agents in one step."""
-    H, W, _ = terrain_rgb.shape
-    # Neighbor indices (clamp to bounds)
-    px_m = np.clip(px - 1, 0, W-1)
-    px_p = np.clip(px + 1, 0, W-1)
-    py_m = np.clip(py - 1, 0, H-1)
-    py_p = np.clip(py + 1, 0, H-1)
+The script also contains the full preprocessing pipeline internally
+(`build_gradient_tile`) which is run once before timing begins and is
+excluded from all runtime measurements.
 
-    # Decode elevation at 5 positions per agent
-    def decode(ix, iy):
-        r = terrain_rgb[iy, ix, 0].astype(np.float32)
-        g = terrain_rgb[iy, ix, 1].astype(np.float32)
-        b = terrain_rgb[iy, ix, 2].astype(np.float32)
-        E = r * 65536.0 + g * 256.0 + b
-        return -10000.0 + 0.1 * E
+## Requirements
 
-    z_c  = decode(px,   py)
-    z_xp = decode(px_p, py)
-    z_xm = decode(px_m, py)
-    z_yp = decode(px,   py_p)
-    z_ym = decode(px,   py_m)
+```
+numpy
+```
 
-    # Precomputed constant d (same tile/zoom for all)
-    d = 19.1          # metres/pixel at zoom 14, lat 43.81
-    g_EW = (z_xp - z_xm) / (2.0 * d)
-    g_NS = (z_ym - z_yp) / (2.0 * d)
+Install with:
 
-    return hx * g_EW + hy * g_NS
+```bash
+pip install numpy
+```
 
-# ----------------------------------------------------------------
-# ENCODED: pixel read + linear decode + dot product, vectorised
-# ----------------------------------------------------------------
-def encoded_step(grad_tile, px, py, hx, hy, g_max=G_MAX):
-    R = grad_tile[py, px, 0].astype(np.float32)
-    G = grad_tile[py, px, 1].astype(np.float32)
-    g_NS = ((R - 128.0) / 127.0) * g_max
-    g_EW = ((G - 128.0) / 127.0) * g_max
-    return hx * g_EW + hy * g_NS
+## Usage
 
-# ----------------------------------------------------------------
-# Full benchmark
-# ----------------------------------------------------------------
-def benchmark(n_agents, n_steps, terrain_rgb, grad_tile):
-    px, py, hx, hy = make_agents(n_agents, TILE_W, TILE_H)
+```bash
+python benchmark.py
+```
 
-    # --- Naive ---
-    t0 = time.perf_counter()
-    for _ in range(n_steps):
-        _ = naive_step(terrain_rgb, px, py, hx, hy)
-    t_naive = time.perf_counter() - t0
+Expected output (results will vary by machine):
 
-    # --- Encoded ---
-    t0 = time.perf_counter()
-    for _ in range(n_steps):
-        _ = encoded_step(grad_tile, px, py, hx, hy)
-    t_enc = time.perf_counter() - t0
+```
+Building synthetic terrain tile ...
+Building encoded gradient tile ...
 
-    speedup = t_naive / t_enc
-    return t_naive, t_enc, speedup
+  Agents    Steps   Naive(s)  Encoded(s)   Speedup
+----------------------------------------------------
+   1,000   10,000      3.28       0.33      10.0x
+   5,000   10,000      9.60       1.30       7.4x
+  10,000   10,000     32.52       3.35       9.7x
 
-# ----------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------
-if __name__ == "__main__":
-    print("Building synthetic terrain tile ...", flush=True)
-    terrain_rgb = make_terrain_rgb(TILE_W, TILE_H)
+Speedup range: 7.4x -- 10.0x
+```
 
-    print("Building encoded gradient tile ...", flush=True)
-    grad_tile, d = build_gradient_tile(terrain_rgb)
+## Configuration
 
-    configs = [1_000, 5_000, 10_000]
+Key parameters are defined at the top of `benchmark.py`:
 
-    print(f"\n{'Agents':>8} {'Steps':>8} {'Naive(s)':>10} {'Encoded(s)':>11} {'Speedup':>9}")
-    print("-" * 52)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `TILE_W`, `TILE_H` | `2048, 2048` | Synthetic tile dimensions in pixels |
+| `G_MAX` | `0.5` | Saturation grade (max representable slope, 50%) |
+| `STEPS` | `10,000` | Number of simulation steps per benchmark run |
 
-    results = []
-    for n_agents in configs:
-        t_naive, t_enc, speedup = benchmark(n_agents, STEPS, terrain_rgb, grad_tile)
-        results.append((n_agents, STEPS, t_naive, t_enc, speedup))
-        print(f"{n_agents:>8,} {STEPS:>8,} {t_naive:>10.3f} {t_enc:>11.3f} {speedup:>8.1f}x")
+Agent population sizes are set in the `configs` list in `__main__`:
+```python
+configs = [1_000, 5_000, 10_000]
+```
 
-    # Print LaTeX table row data
-    print("\n--- LaTeX table rows ---")
-    for n_agents, n_steps, t_naive, t_enc, speedup in results:
-        print(f"{n_agents:>6,} & {n_steps:>6,} & {t_naive:.2f} & {t_enc:.2f} & {speedup:.1f}$\\times$ \\\\")
+## Synthetic Terrain
 
-    speedups = [r[4] for r in results]
-    print(f"\nSpeedup range: {min(speedups):.1f}x -- {max(speedups):.1f}x")
+The benchmark generates a synthetic `2048×2048` Terrain-RGB tile from a
+smooth multi-frequency sinusoidal elevation field:
+
+```python
+elev_m = 200 + 150*sin(x)*cos(0.7y) + 80*cos(1.3x + y)
+```
+
+This produces terrain spanning approximately 50–530 m elevation, representative
+of gently to moderately rolling terrain. The tile is encoded into the
+Terrain-RGB format (24-bit elevation distributed across R, G, B channels)
+before benchmarking begins.
+
+## Encoding Details
+
+Elevation decoding from Terrain-RGB:
+```
+E = R×2¹⁶ + G×2⁸ + B
+z = −10000 + 0.1 × E   (metres, 0.1 m resolution)
+```
+
+Gradient encoding into output tile:
+```
+b = round(128 + 127 × clip(g / g_max, −1, +1))
+```
+
+- Red channel   → NS gradient component (`g_NS`)
+- Green channel → EW gradient component (`g_EW`)
+- Blue channel  → reserved (set to 0)
+
+Runtime grade retrieval for agent heading `(hx, hy)`:
+```
+g_parallel = hx × g_EW + hy × g_NS
+```
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@software{sobhani2025terraingrad,
+  author       = {Sobhani, Ehsan and Pond, Geoffrey},
+  title        = {Terrain Gradient Encoding for Grid-Based Simulation},
+  year         = {2025},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.XXXXXXX},
+  url          = {https://github.com/YOUR_USERNAME/terrain-gradient-encoding}
+}
+```
+
+## License
+
+MIT License
+
+Copyright (c) 2025 Ehsan Sobhani, Geoffrey Pond
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
